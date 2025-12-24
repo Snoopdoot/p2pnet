@@ -25,6 +25,11 @@ type Message struct {
 	FileSize int64  `json:"file_size,omitempty"`
 }
 
+type SharedFile struct {
+	Name string `json:"name"`
+	Size int64  `json:"size"`
+}
+
 type Peer struct {
 	Name    string
 	Addr    string
@@ -92,14 +97,28 @@ func (n *Node) GetPeers() []*Peer {
 }
 
 func (n *Node) ShareFile(filePath string) error {
-	if _, err := os.Stat(filePath); err != nil {
+	stat, err := os.Stat(filePath)
+	if err != nil {
 		return err
 	}
 
 	n.sharedMu.Lock()
-	n.SharedFiles = append(n.SharedFiles, filePath)
-	n.sharedMu.Unlock()
+	defer n.sharedMu.Unlock()
 
+	if stat.IsDir() {
+		// Share all files in directory recursively
+		return filepath.Walk(filePath, func(path string, info os.FileInfo, err error) error {
+			if err != nil {
+				return nil // skip errors
+			}
+			if !info.IsDir() {
+				n.SharedFiles = append(n.SharedFiles, path)
+			}
+			return nil
+		})
+	}
+
+	n.SharedFiles = append(n.SharedFiles, filePath)
 	return nil
 }
 
@@ -255,6 +274,24 @@ func (n *Node) handleTransfer(conn net.Conn) {
 		if n.OnFileOffer != nil {
 			n.OnFileOffer(msg.PeerName, msg.FileName, msg.FileSize)
 		}
+
+	case "list":
+		n.sharedMu.RLock()
+		files := make([]SharedFile, 0, len(n.SharedFiles))
+		for _, f := range n.SharedFiles {
+			stat, err := os.Stat(f)
+			if err != nil {
+				continue
+			}
+			files = append(files, SharedFile{
+				Name: filepath.Base(f),
+				Size: stat.Size(),
+			})
+		}
+		n.sharedMu.RUnlock()
+
+		encoder := json.NewEncoder(conn)
+		encoder.Encode(files)
 	}
 }
 
@@ -331,7 +368,7 @@ func (n *Node) RequestFile(peerAddr string, fileName string) error {
 	return nil
 }
 
-func (n *Node) GetSharedFilesList(peerAddr string) ([]Message, error) {
+func (n *Node) GetSharedFilesList(peerAddr string) ([]SharedFile, error) {
 	conn, err := net.DialTimeout("tcp", peerAddr, 5*time.Second)
 	if err != nil {
 		return nil, err
@@ -348,7 +385,7 @@ func (n *Node) GetSharedFilesList(peerAddr string) ([]Message, error) {
 	}
 
 	decoder := json.NewDecoder(conn)
-	var files []Message
+	var files []SharedFile
 	if err := decoder.Decode(&files); err != nil {
 		return nil, err
 	}
