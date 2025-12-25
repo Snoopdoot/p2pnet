@@ -583,7 +583,7 @@ func (n *Node) RequestFile(ctx context.Context, peerAddr string, fileName string
 	remaining := response.FileSize - received
 
 	// Copy in chunks to allow progress updates
-	chunkSize := int64(10 * 1024 * 1024) // 10MB chunks
+	chunkSize := int64(256 * 1024) // 256KB chunks for frequent updates
 	for remaining > 0 {
 		select {
 		case <-ctx.Done():
