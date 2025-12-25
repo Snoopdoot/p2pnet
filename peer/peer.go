@@ -428,19 +428,24 @@ func (n *Node) listenBroadcast() {
 }
 
 func (n *Node) listenTransfer() {
-	tcpListener, err := net.Listen("tcp", fmt.Sprintf(":%d", TransferPort))
+	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", TransferPort))
 	if err != nil {
 		return
 	}
-	defer tcpListener.Close()
-
-	listener := tls.NewListener(tcpListener, n.tlsConfig)
+	defer listener.Close()
 
 	for n.running {
-		tcpListener.(*net.TCPListener).SetDeadline(time.Now().Add(time.Second))
+		listener.(*net.TCPListener).SetDeadline(time.Now().Add(time.Second))
 		conn, err := listener.Accept()
 		if err != nil {
 			continue
+		}
+
+		// Set TCP options for better performance
+		if tcpConn, ok := conn.(*net.TCPConn); ok {
+			tcpConn.SetNoDelay(true)
+			tcpConn.SetReadBuffer(BufferSize)
+			tcpConn.SetWriteBuffer(BufferSize)
 		}
 
 		go n.handleTransfer(conn)
@@ -523,13 +528,18 @@ func (n *Node) handleTransfer(conn net.Conn) {
 
 func (n *Node) RequestFile(ctx context.Context, peerAddr string, fileName string) error {
 	dialer := &net.Dialer{Timeout: 5 * time.Second}
-	conn, err := tls.DialWithDialer(dialer, "tcp", peerAddr, &tls.Config{
-		InsecureSkipVerify: true,
-	})
+	conn, err := dialer.DialContext(ctx, "tcp", peerAddr)
 	if err != nil {
 		return err
 	}
 	defer conn.Close()
+
+	// Set TCP options for better performance
+	if tcpConn, ok := conn.(*net.TCPConn); ok {
+		tcpConn.SetNoDelay(true)
+		tcpConn.SetReadBuffer(BufferSize)
+		tcpConn.SetWriteBuffer(BufferSize)
+	}
 
 	msg := Message{
 		Type:     "request",
@@ -571,88 +581,77 @@ func (n *Node) RequestFile(ctx context.Context, peerAddr string, fileName string
 		StartTime: startTime,
 	}
 
-	// Use MultiReader to first drain any bytes buffered by the JSON decoder,
-	// then continue reading from the connection. This fixes cross-platform
-	// issues where TCP packetization differences cause the decoder to buffer
-	// part of the file data.
-	// Wrap in buffered reader for efficient network I/O
-	reader := bufio.NewReaderSize(io.MultiReader(decoder.Buffered(), conn), BufferSize)
+	// Drain any bytes buffered by the JSON decoder first
+	buffered := decoder.Buffered()
+	bufferedBytes, _ := io.ReadAll(buffered)
+	if len(bufferedBytes) > 0 {
+		bufWriter.Write(bufferedBytes)
+	}
+	received := int64(len(bufferedBytes))
 
+	// Simple copy loop with progress tracking
 	buf := make([]byte, BufferSize)
-	var received int64 = 0
 	lastUpdate := time.Now()
-	lastCancelCheck := time.Now()
 
 	for received < response.FileSize {
-		// Check for cancellation every 500ms (not every read)
-		if time.Since(lastCancelCheck) >= 500*time.Millisecond {
-			select {
-			case <-ctx.Done():
-				bufWriter.Flush()
-				file.Close()
-				os.Remove(destPath) // Clean up partial file
-				return ctx.Err()
-			default:
-			}
-			lastCancelCheck = time.Now()
-			// Set a generous deadline for the next batch of reads
-			conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+		// Check cancellation periodically
+		select {
+		case <-ctx.Done():
+			bufWriter.Flush()
+			file.Close()
+			os.Remove(destPath)
+			return ctx.Err()
+		default:
 		}
 
-		nr, err := reader.Read(buf)
+		nr, err := conn.Read(buf)
+		if nr > 0 {
+			nw, werr := bufWriter.Write(buf[:nr])
+			if werr != nil {
+				return werr
+			}
+			if nw != nr {
+				return fmt.Errorf("short write")
+			}
+			received += int64(nr)
+
+			// Update progress every 100ms
+			if time.Since(lastUpdate) >= 100*time.Millisecond {
+				transfer.BytesReceived = received
+				transfer.Progress = float64(received) / float64(response.FileSize)
+				elapsed := time.Since(startTime).Seconds()
+				if elapsed > 0 {
+					transfer.BytesPerSecond = float64(received) / elapsed
+					remaining := response.FileSize - received
+					if transfer.BytesPerSecond > 0 {
+						transfer.ETA = time.Duration(float64(remaining)/transfer.BytesPerSecond) * time.Second
+					}
+				}
+				if n.OnTransfer != nil {
+					n.OnTransfer(transfer)
+				}
+				lastUpdate = time.Now()
+			}
+		}
 		if err != nil {
 			if err == io.EOF {
 				break
 			}
-			// On timeout, check cancellation
-			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				select {
-				case <-ctx.Done():
-					bufWriter.Flush()
-					file.Close()
-					os.Remove(destPath)
-					return ctx.Err()
-				default:
-					continue
-				}
-			}
 			return err
-		}
-		nw, err := bufWriter.Write(buf[:nr])
-		if err != nil {
-			return err
-		}
-		if nw != nr {
-			return fmt.Errorf("short write")
-		}
-		received += int64(nr)
-
-		// Calculate progress, speed, and ETA
-		transfer.BytesReceived = received
-		transfer.Progress = float64(received) / float64(response.FileSize)
-
-		elapsed := time.Since(startTime).Seconds()
-		if elapsed > 0 {
-			transfer.BytesPerSecond = float64(received) / elapsed
-			remainingBytes := response.FileSize - received
-			if transfer.BytesPerSecond > 0 {
-				transfer.ETA = time.Duration(float64(remainingBytes)/transfer.BytesPerSecond) * time.Second
-			}
-		}
-
-		// Throttle UI updates to every 100ms
-		if time.Since(lastUpdate) >= 100*time.Millisecond {
-			if n.OnTransfer != nil {
-				n.OnTransfer(transfer)
-			}
-			lastUpdate = time.Now()
 		}
 	}
 
+	bufWriter.Flush()
+
 	// Final update
+	transfer.Progress = 1.0
+	transfer.ETA = 0
+	transfer.BytesReceived = response.FileSize
+	elapsed := time.Since(startTime).Seconds()
+	if elapsed > 0 {
+		transfer.BytesPerSecond = float64(response.FileSize) / elapsed
+	}
 	if n.OnTransfer != nil {
-		transfer.Progress = 1.0
-		transfer.ETA = 0
 		n.OnTransfer(transfer)
 	}
 
@@ -665,9 +664,7 @@ func (n *Node) RequestFile(ctx context.Context, peerAddr string, fileName string
 
 func (n *Node) GetSharedFilesList(peerAddr string) ([]SharedFile, error) {
 	dialer := &net.Dialer{Timeout: 5 * time.Second}
-	conn, err := tls.DialWithDialer(dialer, "tcp", peerAddr, &tls.Config{
-		InsecureSkipVerify: true,
-	})
+	conn, err := dialer.Dial("tcp", peerAddr)
 	if err != nil {
 		return nil, err
 	}
