@@ -1,6 +1,7 @@
 package peer
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -44,10 +45,14 @@ type Peer struct {
 }
 
 type FileTransfer struct {
-	FileName string
-	FileSize int64
-	Progress float64
-	From     string
+	FileName       string
+	FileSize       int64
+	Progress       float64
+	From           string
+	BytesReceived  int64
+	StartTime      time.Time
+	BytesPerSecond float64
+	ETA            time.Duration
 }
 
 type Node struct {
@@ -355,7 +360,7 @@ func (n *Node) handleTransfer(conn net.Conn) {
 	}
 }
 
-func (n *Node) RequestFile(peerAddr string, fileName string) error {
+func (n *Node) RequestFile(ctx context.Context, peerAddr string, fileName string) error {
 	dialer := &net.Dialer{Timeout: 5 * time.Second}
 	conn, err := tls.DialWithDialer(dialer, "tcp", peerAddr, &tls.Config{
 		InsecureSkipVerify: true,
@@ -392,11 +397,13 @@ func (n *Node) RequestFile(peerAddr string, fileName string) error {
 	}
 	defer file.Close()
 
+	startTime := time.Now()
 	transfer := &FileTransfer{
-		FileName: response.FileName,
-		FileSize: response.FileSize,
-		Progress: 0,
-		From:     peerAddr,
+		FileName:  response.FileName,
+		FileSize:  response.FileSize,
+		Progress:  0,
+		From:      peerAddr,
+		StartTime: startTime,
 	}
 
 	// Use MultiReader to first drain any bytes buffered by the JSON decoder,
@@ -407,10 +414,26 @@ func (n *Node) RequestFile(peerAddr string, fileName string) error {
 
 	buf := make([]byte, BufferSize)
 	var received int64 = 0
+	lastUpdate := time.Now()
 
 	for received < response.FileSize {
+		// Check for cancellation
+		select {
+		case <-ctx.Done():
+			file.Close()
+			os.Remove(destPath) // Clean up partial file
+			return ctx.Err()
+		default:
+		}
+
+		// Set read deadline to allow cancellation checks
+		conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+
 		nr, err := reader.Read(buf)
 		if err != nil {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				continue // Timeout - check cancellation and retry
+			}
 			if err == io.EOF {
 				break
 			}
@@ -424,10 +447,34 @@ func (n *Node) RequestFile(peerAddr string, fileName string) error {
 			return fmt.Errorf("short write")
 		}
 		received += int64(nr)
+
+		// Calculate progress, speed, and ETA
+		transfer.BytesReceived = received
 		transfer.Progress = float64(received) / float64(response.FileSize)
-		if n.OnTransfer != nil {
-			n.OnTransfer(transfer)
+
+		elapsed := time.Since(startTime).Seconds()
+		if elapsed > 0 {
+			transfer.BytesPerSecond = float64(received) / elapsed
+			remainingBytes := response.FileSize - received
+			if transfer.BytesPerSecond > 0 {
+				transfer.ETA = time.Duration(float64(remainingBytes)/transfer.BytesPerSecond) * time.Second
+			}
 		}
+
+		// Throttle UI updates to every 100ms
+		if time.Since(lastUpdate) >= 100*time.Millisecond {
+			if n.OnTransfer != nil {
+				n.OnTransfer(transfer)
+			}
+			lastUpdate = time.Now()
+		}
+	}
+
+	// Final update
+	if n.OnTransfer != nil {
+		transfer.Progress = 1.0
+		transfer.ETA = 0
+		n.OnTransfer(transfer)
 	}
 
 	if n.OnFileReceived != nil {

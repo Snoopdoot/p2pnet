@@ -1,10 +1,12 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"sync"
 	"time"
 
@@ -24,18 +26,26 @@ type PeerFile struct {
 	PeerAddr string
 }
 
+type downloadState struct {
+	fileName string
+	cancel   context.CancelFunc
+}
+
 type P2PApp struct {
-	window        fyne.Window
-	node          *peer.Node
-	peerList      *widget.List
-	sharedList    *widget.List
-	peerFilesList *widget.List
-	peers         []*peer.Peer
-	allPeerFiles  []PeerFile
-	filesMu       sync.RWMutex
-	statusLabel   *widget.Label
-	progressBar   *widget.ProgressBar
-	stopChan      chan struct{}
+	window           fyne.Window
+	node             *peer.Node
+	peerList         *widget.List
+	sharedList       *widget.List
+	peerFilesList    *widget.List
+	peers            []*peer.Peer
+	allPeerFiles     []PeerFile
+	filesMu          sync.RWMutex
+	statusLabel      *widget.Label
+	progressBar      *widget.ProgressBar
+	cancelBtn        *widget.Button
+	activeDownload   *downloadState
+	activeDownloadMu sync.Mutex
+	stopChan         chan struct{}
 }
 
 func main() {
@@ -89,6 +99,10 @@ func (p *P2PApp) setupUI() {
 	p.statusLabel = widget.NewLabel("Starting...")
 	p.progressBar = widget.NewProgressBar()
 	p.progressBar.Hide()
+	p.cancelBtn = widget.NewButton("Cancel", func() {
+		p.cancelDownload()
+	})
+	p.cancelBtn.Hide()
 
 	// Peer list
 	p.peerList = widget.NewList(
@@ -233,8 +247,9 @@ func (p *P2PApp) setupUI() {
 		widget.NewLabel("P2PNet"),
 	)
 
+	progressRow := container.NewBorder(nil, nil, nil, p.cancelBtn, p.progressBar)
 	statusBar := container.NewVBox(
-		p.progressBar,
+		progressRow,
 		p.statusLabel,
 	)
 
@@ -261,6 +276,14 @@ func (p *P2PApp) refreshAllPeerFiles() {
 		}
 	}
 
+	// Sort by peer name, then by filename for stable ordering
+	sort.Slice(allFiles, func(i, j int) bool {
+		if allFiles[i].PeerName != allFiles[j].PeerName {
+			return allFiles[i].PeerName < allFiles[j].PeerName
+		}
+		return allFiles[i].File.Name < allFiles[j].File.Name
+	})
+
 	p.filesMu.Lock()
 	p.allPeerFiles = allFiles
 	p.filesMu.Unlock()
@@ -286,19 +309,47 @@ func (p *P2PApp) autoRefresh() {
 }
 
 func (p *P2PApp) downloadFile(peerAddr string, fileName string) {
+	ctx, cancel := context.WithCancel(context.Background())
+
+	p.activeDownloadMu.Lock()
+	p.activeDownload = &downloadState{
+		fileName: fileName,
+		cancel:   cancel,
+	}
+	p.activeDownloadMu.Unlock()
+
 	fyne.Do(func() {
 		p.progressBar.Show()
 		p.progressBar.SetValue(0)
+		p.cancelBtn.Show()
 		p.statusLabel.SetText(fmt.Sprintf("Downloading: %s", fileName))
 	})
 
-	err := p.node.RequestFile(peerAddr, fileName)
+	err := p.node.RequestFile(ctx, peerAddr, fileName)
+
+	p.activeDownloadMu.Lock()
+	p.activeDownload = nil
+	p.activeDownloadMu.Unlock()
+
 	fyne.Do(func() {
-		if err != nil {
-			p.statusLabel.SetText(fmt.Sprintf("Error: %v", err))
-		}
 		p.progressBar.Hide()
+		p.cancelBtn.Hide()
+		if err != nil {
+			if err == context.Canceled {
+				p.statusLabel.SetText(fmt.Sprintf("Cancelled: %s", fileName))
+			} else {
+				p.statusLabel.SetText(fmt.Sprintf("Error: %v", err))
+			}
+		}
 	})
+}
+
+func (p *P2PApp) cancelDownload() {
+	p.activeDownloadMu.Lock()
+	defer p.activeDownloadMu.Unlock()
+	if p.activeDownload != nil {
+		p.activeDownload.cancel()
+	}
 }
 
 func (p *P2PApp) setupCallbacks() {
@@ -323,6 +374,10 @@ func (p *P2PApp) setupCallbacks() {
 	p.node.OnTransfer = func(transfer *peer.FileTransfer) {
 		fyne.Do(func() {
 			p.progressBar.SetValue(transfer.Progress)
+			speedStr := formatSpeed(transfer.BytesPerSecond)
+			etaStr := formatDuration(transfer.ETA)
+			p.statusLabel.SetText(fmt.Sprintf("Downloading: %s - %s - %s remaining",
+				transfer.FileName, speedStr, etaStr))
 		})
 	}
 
@@ -345,4 +400,38 @@ func formatSize(bytes int64) string {
 		exp++
 	}
 	return fmt.Sprintf("%.1f %cB", float64(bytes)/float64(div), "KMGTPE"[exp])
+}
+
+func formatSpeed(bytesPerSecond float64) string {
+	if bytesPerSecond <= 0 {
+		return "-- B/s"
+	}
+	const unit = 1024
+	if bytesPerSecond < unit {
+		return fmt.Sprintf("%.0f B/s", bytesPerSecond)
+	}
+	div, exp := float64(unit), 0
+	for n := bytesPerSecond / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %cB/s", bytesPerSecond/div, "KMGTPE"[exp])
+}
+
+func formatDuration(d time.Duration) string {
+	if d <= 0 {
+		return "--"
+	}
+	d = d.Round(time.Second)
+	if d < time.Minute {
+		return fmt.Sprintf("%ds", int(d.Seconds()))
+	}
+	if d < time.Hour {
+		m := int(d.Minutes())
+		s := int(d.Seconds()) % 60
+		return fmt.Sprintf("%dm %ds", m, s)
+	}
+	h := int(d.Hours())
+	m := int(d.Minutes()) % 60
+	return fmt.Sprintf("%dh %dm", h, m)
 }
