@@ -5,6 +5,8 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sync"
+	"time"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/app"
@@ -16,6 +18,12 @@ import (
 	"p2pnet/peer"
 )
 
+type PeerFile struct {
+	File     peer.SharedFile
+	PeerName string
+	PeerAddr string
+}
+
 type P2PApp struct {
 	window        fyne.Window
 	node          *peer.Node
@@ -23,10 +31,11 @@ type P2PApp struct {
 	sharedList    *widget.List
 	peerFilesList *widget.List
 	peers         []*peer.Peer
-	peerFiles     []peer.SharedFile
+	allPeerFiles  []PeerFile
+	filesMu       sync.RWMutex
 	statusLabel   *widget.Label
 	progressBar   *widget.ProgressBar
-	selectedPeer  *peer.Peer
+	stopChan      chan struct{}
 }
 
 func main() {
@@ -52,10 +61,11 @@ func main() {
 	node := peer.NewNode(hostname, downloadDir)
 
 	p2pApp := &P2PApp{
-		window:    w,
-		node:      node,
-		peers:     make([]*peer.Peer, 0),
-		peerFiles: make([]peer.SharedFile, 0),
+		window:       w,
+		node:         node,
+		peers:        make([]*peer.Peer, 0),
+		allPeerFiles: make([]PeerFile, 0),
+		stopChan:     make(chan struct{}),
 	}
 
 	p2pApp.setupUI()
@@ -65,7 +75,10 @@ func main() {
 		dialog.ShowError(err, w)
 	}
 
+	go p2pApp.autoRefresh()
+
 	w.SetOnClosed(func() {
+		close(p2pApp.stopChan)
 		node.Stop()
 	})
 
@@ -90,42 +103,45 @@ func (p *P2PApp) setupUI() {
 		},
 	)
 
-	p.peerList.OnSelected = func(id widget.ListItemID) {
-		if id < len(p.peers) {
-			p.selectedPeer = p.peers[id]
-			p.statusLabel.SetText(fmt.Sprintf("Loading files from %s...", p.selectedPeer.Name))
-			go p.loadPeerFiles()
-		}
-	}
-
-	// Peer's available files list
+	// All available files list (from all peers)
 	p.peerFilesList = widget.NewList(
-		func() int { return len(p.peerFiles) },
+		func() int {
+			p.filesMu.RLock()
+			defer p.filesMu.RUnlock()
+			return len(p.allPeerFiles)
+		},
 		func() fyne.CanvasObject {
-			return widget.NewLabel("filename.ext (0 MB)")
+			return widget.NewLabel("filename.ext (0 MB) - PeerName")
 		},
 		func(id widget.ListItemID, obj fyne.CanvasObject) {
-			if id < len(p.peerFiles) {
-				f := p.peerFiles[id]
-				size := formatSize(f.Size)
-				obj.(*widget.Label).SetText(fmt.Sprintf("%s (%s)", f.Name, size))
+			p.filesMu.RLock()
+			defer p.filesMu.RUnlock()
+			if id < len(p.allPeerFiles) {
+				pf := p.allPeerFiles[id]
+				size := formatSize(pf.File.Size)
+				obj.(*widget.Label).SetText(fmt.Sprintf("%s (%s) - %s", pf.File.Name, size, pf.PeerName))
 			}
 		},
 	)
 
 	p.peerFilesList.OnSelected = func(id widget.ListItemID) {
-		if id < len(p.peerFiles) && p.selectedPeer != nil {
-			file := p.peerFiles[id]
-			dialog.ShowConfirm("Download File",
-				fmt.Sprintf("Download '%s' (%s)?", file.Name, formatSize(file.Size)),
-				func(ok bool) {
-					if ok {
-						go p.downloadFile(file.Name)
-					}
-				},
-				p.window,
-			)
+		p.filesMu.RLock()
+		if id >= len(p.allPeerFiles) {
+			p.filesMu.RUnlock()
+			return
 		}
+		pf := p.allPeerFiles[id]
+		p.filesMu.RUnlock()
+
+		dialog.ShowConfirm("Download File",
+			fmt.Sprintf("Download '%s' (%s) from %s?", pf.File.Name, formatSize(pf.File.Size), pf.PeerName),
+			func(ok bool) {
+				if ok {
+					go p.downloadFile(pf.PeerAddr, pf.File.Name)
+				}
+			},
+			p.window,
+		)
 		p.peerFilesList.UnselectAll()
 	}
 
@@ -194,14 +210,12 @@ func (p *P2PApp) setupUI() {
 	})
 
 	refreshBtn := widget.NewButton("Refresh", func() {
-		if p.selectedPeer != nil {
-			go p.loadPeerFiles()
-		}
+		go p.refreshAllPeerFiles()
 	})
 
 	// Layout - 3 columns
 	peersCard := widget.NewCard("Peers", "On your network", p.peerList)
-	peerFilesCard := widget.NewCard("Available Files", "Click to download", p.peerFilesList)
+	peerFilesCard := widget.NewCard("All Available Files", "Click to download (auto-refreshes)", p.peerFilesList)
 	sharedCard := widget.NewCard("Your Shared Files", "Visible to peers", p.sharedList)
 
 	leftPanel := container.NewBorder(nil, nil, nil, nil, peersCard)
@@ -229,45 +243,56 @@ func (p *P2PApp) setupUI() {
 	p.statusLabel.SetText("Ready - Scanning for peers...")
 }
 
-func (p *P2PApp) loadPeerFiles() {
-	if p.selectedPeer == nil {
-		return
+func (p *P2PApp) refreshAllPeerFiles() {
+	peers := p.node.GetPeers()
+	var allFiles []PeerFile
+
+	for _, peer := range peers {
+		files, err := p.node.GetSharedFilesList(peer.Addr)
+		if err != nil {
+			continue
+		}
+		for _, f := range files {
+			allFiles = append(allFiles, PeerFile{
+				File:     f,
+				PeerName: peer.Name,
+				PeerAddr: peer.Addr,
+			})
+		}
 	}
 
-	files, err := p.node.GetSharedFilesList(p.selectedPeer.Addr)
-	if err != nil {
-		fyne.Do(func() {
-			p.statusLabel.SetText(fmt.Sprintf("Error: %v", err))
-			p.peerFiles = []peer.SharedFile{}
-			p.peerFilesList.Refresh()
-		})
-		return
-	}
+	p.filesMu.Lock()
+	p.allPeerFiles = allFiles
+	p.filesMu.Unlock()
 
 	fyne.Do(func() {
-		p.peerFiles = files
 		p.peerFilesList.Refresh()
-
-		if len(files) == 0 {
-			p.statusLabel.SetText(fmt.Sprintf("%s has no shared files", p.selectedPeer.Name))
-		} else {
-			p.statusLabel.SetText(fmt.Sprintf("%s is sharing %d file(s)", p.selectedPeer.Name, len(files)))
-		}
+		p.statusLabel.SetText(fmt.Sprintf("Found %d file(s) from %d peer(s)", len(allFiles), len(peers)))
 	})
 }
 
-func (p *P2PApp) downloadFile(fileName string) {
-	if p.selectedPeer == nil {
-		return
-	}
+func (p *P2PApp) autoRefresh() {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
 
+	for {
+		select {
+		case <-p.stopChan:
+			return
+		case <-ticker.C:
+			p.refreshAllPeerFiles()
+		}
+	}
+}
+
+func (p *P2PApp) downloadFile(peerAddr string, fileName string) {
 	fyne.Do(func() {
 		p.progressBar.Show()
 		p.progressBar.SetValue(0)
 		p.statusLabel.SetText(fmt.Sprintf("Downloading: %s", fileName))
 	})
 
-	err := p.node.RequestFile(p.selectedPeer.Addr, fileName)
+	err := p.node.RequestFile(peerAddr, fileName)
 	fyne.Do(func() {
 		if err != nil {
 			p.statusLabel.SetText(fmt.Sprintf("Error: %v", err))
@@ -283,19 +308,16 @@ func (p *P2PApp) setupCallbacks() {
 			p.peerList.Refresh()
 			p.statusLabel.SetText(fmt.Sprintf("Found peer: %s", foundPeer.Name))
 		})
+		go p.refreshAllPeerFiles()
 	}
 
 	p.node.OnPeerLost = func(lostPeer *peer.Peer) {
 		fyne.Do(func() {
 			p.peers = p.node.GetPeers()
 			p.peerList.Refresh()
-			if p.selectedPeer != nil && p.selectedPeer.Addr == lostPeer.Addr {
-				p.selectedPeer = nil
-				p.peerFiles = []peer.SharedFile{}
-				p.peerFilesList.Refresh()
-			}
 			p.statusLabel.SetText(fmt.Sprintf("Lost peer: %s", lostPeer.Name))
 		})
+		go p.refreshAllPeerFiles()
 	}
 
 	p.node.OnTransfer = func(transfer *peer.FileTransfer) {
