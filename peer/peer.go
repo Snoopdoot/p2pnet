@@ -2,6 +2,7 @@ package peer
 
 import (
 	"archive/zip"
+	"bufio"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -24,7 +25,7 @@ import (
 const (
 	BroadcastPort = 42069
 	TransferPort  = 42070
-	BufferSize    = 256 * 1024 // 256KB for better throughput
+	BufferSize    = 1024 * 1024 // 1MB for better throughput
 )
 
 type Message struct {
@@ -483,10 +484,17 @@ func (n *Node) handleTransfer(conn net.Conn) {
 			FileName: msg.FileName,
 			FileSize: stat.Size(),
 		}
-		encoder := json.NewEncoder(conn)
-		encoder.Encode(response)
 
-		io.Copy(conn, file)
+		// Use buffered writer to reduce TLS record overhead
+		bufWriter := bufio.NewWriterSize(conn, BufferSize)
+		encoder := json.NewEncoder(bufWriter)
+		encoder.Encode(response)
+		bufWriter.Flush()
+
+		// Stream file with large buffer
+		buf := make([]byte, BufferSize)
+		io.CopyBuffer(bufWriter, file, buf)
+		bufWriter.Flush()
 
 	case "offer":
 		if n.OnFileOffer != nil {
@@ -550,6 +558,10 @@ func (n *Node) RequestFile(ctx context.Context, peerAddr string, fileName string
 	}
 	defer file.Close()
 
+	// Use buffered writer for efficient disk I/O
+	bufWriter := bufio.NewWriterSize(file, BufferSize)
+	defer bufWriter.Flush()
+
 	startTime := time.Now()
 	transfer := &FileTransfer{
 		FileName:  response.FileName,
@@ -563,7 +575,8 @@ func (n *Node) RequestFile(ctx context.Context, peerAddr string, fileName string
 	// then continue reading from the connection. This fixes cross-platform
 	// issues where TCP packetization differences cause the decoder to buffer
 	// part of the file data.
-	reader := io.MultiReader(decoder.Buffered(), conn)
+	// Wrap in buffered reader for efficient network I/O
+	reader := bufio.NewReaderSize(io.MultiReader(decoder.Buffered(), conn), BufferSize)
 
 	buf := make([]byte, BufferSize)
 	var received int64 = 0
@@ -575,6 +588,7 @@ func (n *Node) RequestFile(ctx context.Context, peerAddr string, fileName string
 		if time.Since(lastCancelCheck) >= 500*time.Millisecond {
 			select {
 			case <-ctx.Done():
+				bufWriter.Flush()
 				file.Close()
 				os.Remove(destPath) // Clean up partial file
 				return ctx.Err()
@@ -594,6 +608,7 @@ func (n *Node) RequestFile(ctx context.Context, peerAddr string, fileName string
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 				select {
 				case <-ctx.Done():
+					bufWriter.Flush()
 					file.Close()
 					os.Remove(destPath)
 					return ctx.Err()
@@ -603,7 +618,7 @@ func (n *Node) RequestFile(ctx context.Context, peerAddr string, fileName string
 			}
 			return err
 		}
-		nw, err := file.Write(buf[:nr])
+		nw, err := bufWriter.Write(buf[:nr])
 		if err != nil {
 			return err
 		}
