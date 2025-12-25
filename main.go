@@ -142,26 +142,6 @@ func (p *P2PApp) setupUI() {
 		},
 	)
 
-	// Click to unshare
-	p.sharedList.OnSelected = func(id widget.ListItemID) {
-		if id < len(p.node.SharedFiles) {
-			filePath := p.node.SharedFiles[id]
-			fileName := filepath.Base(filePath)
-			dialog.ShowConfirm("Unshare File",
-				fmt.Sprintf("Stop sharing '%s'?", fileName),
-				func(ok bool) {
-					if ok {
-						p.node.UnshareFile(filePath)
-						p.sharedList.Refresh()
-						p.statusLabel.SetText(fmt.Sprintf("Unshared: %s", fileName))
-					}
-				},
-				p.window,
-			)
-		}
-		p.sharedList.UnselectAll()
-	}
-
 	// Buttons
 	addFileBtn := widget.NewButton("+ Share File", func() {
 		dialog.ShowFileOpen(func(reader fyne.URIReadCloser, err error) {
@@ -194,35 +174,6 @@ func (p *P2PApp) setupUI() {
 		}, p.window)
 	})
 
-	// Manual path entry for when file explorer doesn't work
-	addPathBtn := widget.NewButton("+ Enter Path", func() {
-		entry := widget.NewEntry()
-		if runtime.GOOS == "windows" {
-			entry.SetPlaceHolder("C:\\Users\\You\\file.txt or folder")
-		} else {
-			entry.SetPlaceHolder("/home/you/file.txt or folder")
-		}
-
-		dialog.ShowForm("Share by Path", "Share", "Cancel",
-			[]*widget.FormItem{
-				widget.NewFormItem("Path", entry),
-			},
-			func(ok bool) {
-				if !ok || entry.Text == "" {
-					return
-				}
-				path := entry.Text
-				if err := p.node.ShareFile(path); err != nil {
-					dialog.ShowError(err, p.window)
-					return
-				}
-				p.sharedList.Refresh()
-				p.statusLabel.SetText(fmt.Sprintf("Now sharing: %s", filepath.Base(path)))
-			},
-			p.window,
-		)
-	})
-
 	refreshBtn := widget.NewButton("Refresh", func() {
 		if p.selectedPeer != nil {
 			go p.loadPeerFiles()
@@ -232,11 +183,11 @@ func (p *P2PApp) setupUI() {
 	// Layout - 3 columns
 	peersCard := widget.NewCard("Peers", "On your network", p.peerList)
 	peerFilesCard := widget.NewCard("Available Files", "Click to download", p.peerFilesList)
-	sharedCard := widget.NewCard("Your Shared Files", "Click to unshare", p.sharedList)
+	sharedCard := widget.NewCard("Your Shared Files", "Visible to peers", p.sharedList)
 
 	leftPanel := container.NewBorder(nil, nil, nil, nil, peersCard)
 	middlePanel := container.NewBorder(nil, refreshBtn, nil, nil, peerFilesCard)
-	shareButtons := container.NewVBox(addFileBtn, addFolderBtn, addPathBtn)
+	shareButtons := container.NewVBox(addFileBtn, addFolderBtn)
 	rightPanel := container.NewBorder(nil, shareButtons, nil, nil, sharedCard)
 
 	split1 := container.NewHSplit(leftPanel, middlePanel)
