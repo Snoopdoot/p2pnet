@@ -142,6 +142,25 @@ func (p *P2PApp) setupUI() {
 		},
 	)
 
+	p.sharedList.OnSelected = func(id widget.ListItemID) {
+		if id < len(p.node.SharedFiles) {
+			filePath := p.node.SharedFiles[id]
+			fileName := filepath.Base(filePath)
+			dialog.ShowConfirm("Stop Sharing",
+				fmt.Sprintf("Stop sharing '%s'?", fileName),
+				func(ok bool) {
+					if ok {
+						p.node.UnshareFile(filePath)
+						p.sharedList.Refresh()
+						p.statusLabel.SetText(fmt.Sprintf("Stopped sharing: %s", fileName))
+					}
+				},
+				p.window,
+			)
+		}
+		p.sharedList.UnselectAll()
+	}
+
 	// Buttons
 	addFileBtn := widget.NewButton("+ Share File", func() {
 		dialog.ShowFileOpen(func(reader fyne.URIReadCloser, err error) {

@@ -1,9 +1,16 @@
 package peer
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/json"
 	"fmt"
 	"io"
+	"math/big"
 	"net"
 	"os"
 	"path/filepath"
@@ -44,28 +51,71 @@ type FileTransfer struct {
 }
 
 type Node struct {
-	Name          string
-	peers         map[string]*Peer
-	peersMu       sync.RWMutex
-	SharedFiles   []string
-	sharedMu      sync.RWMutex
-	OnPeerFound   func(peer *Peer)
-	OnPeerLost    func(peer *Peer)
-	OnFileOffer   func(from string, fileName string, fileSize int64)
-	OnTransfer    func(transfer *FileTransfer)
+	Name           string
+	peers          map[string]*Peer
+	peersMu        sync.RWMutex
+	SharedFiles    []string
+	sharedMu       sync.RWMutex
+	OnPeerFound    func(peer *Peer)
+	OnPeerLost     func(peer *Peer)
+	OnFileOffer    func(from string, fileName string, fileSize int64)
+	OnTransfer     func(transfer *FileTransfer)
 	OnFileReceived func(filePath string)
-	running       bool
-	stopChan      chan struct{}
-	downloadDir   string
+	running        bool
+	stopChan       chan struct{}
+	downloadDir    string
+	tlsConfig      *tls.Config
+}
+
+func generateTLSConfig() (*tls.Config, error) {
+	privateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return nil, err
+	}
+
+	serialNumber, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+	if err != nil {
+		return nil, err
+	}
+
+	template := x509.Certificate{
+		SerialNumber: serialNumber,
+		Subject: pkix.Name{
+			Organization: []string{"P2PNet"},
+		},
+		NotBefore:             time.Now(),
+		NotAfter:              time.Now().Add(365 * 24 * time.Hour),
+		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+	}
+
+	certDER, err := x509.CreateCertificate(rand.Reader, &template, &template, &privateKey.PublicKey, privateKey)
+	if err != nil {
+		return nil, err
+	}
+
+	return &tls.Config{
+		Certificates: []tls.Certificate{{
+			Certificate: [][]byte{certDER},
+			PrivateKey:  privateKey,
+		}},
+	}, nil
 }
 
 func NewNode(name string, downloadDir string) *Node {
+	tlsConfig, err := generateTLSConfig()
+	if err != nil {
+		panic("failed to generate TLS config: " + err.Error())
+	}
+
 	return &Node{
 		Name:        name,
 		peers:       make(map[string]*Peer),
 		SharedFiles: make([]string, 0),
 		stopChan:    make(chan struct{}),
 		downloadDir: downloadDir,
+		tlsConfig:   tlsConfig,
 	}
 }
 
@@ -211,14 +261,16 @@ func (n *Node) listenBroadcast() {
 }
 
 func (n *Node) listenTransfer() {
-	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", TransferPort))
+	tcpListener, err := net.Listen("tcp", fmt.Sprintf(":%d", TransferPort))
 	if err != nil {
 		return
 	}
-	defer listener.Close()
+	defer tcpListener.Close()
+
+	listener := tls.NewListener(tcpListener, n.tlsConfig)
 
 	for n.running {
-		listener.(*net.TCPListener).SetDeadline(time.Now().Add(time.Second))
+		tcpListener.(*net.TCPListener).SetDeadline(time.Now().Add(time.Second))
 		conn, err := listener.Accept()
 		if err != nil {
 			continue
@@ -296,7 +348,10 @@ func (n *Node) handleTransfer(conn net.Conn) {
 }
 
 func (n *Node) RequestFile(peerAddr string, fileName string) error {
-	conn, err := net.DialTimeout("tcp", peerAddr, 5*time.Second)
+	dialer := &net.Dialer{Timeout: 5 * time.Second}
+	conn, err := tls.DialWithDialer(dialer, "tcp", peerAddr, &tls.Config{
+		InsecureSkipVerify: true,
+	})
 	if err != nil {
 		return err
 	}
@@ -375,7 +430,10 @@ func (n *Node) RequestFile(peerAddr string, fileName string) error {
 }
 
 func (n *Node) GetSharedFilesList(peerAddr string) ([]SharedFile, error) {
-	conn, err := net.DialTimeout("tcp", peerAddr, 5*time.Second)
+	dialer := &net.Dialer{Timeout: 5 * time.Second}
+	conn, err := tls.DialWithDialer(dialer, "tcp", peerAddr, &tls.Config{
+		InsecureSkipVerify: true,
+	})
 	if err != nil {
 		return nil, err
 	}
