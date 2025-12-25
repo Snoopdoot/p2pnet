@@ -1,6 +1,7 @@
 package peer
 
 import (
+	"archive/zip"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -15,6 +16,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -61,6 +63,7 @@ type Node struct {
 	peersMu        sync.RWMutex
 	SharedFiles    []string
 	sharedMu       sync.RWMutex
+	tempZips       []string
 	OnPeerFound    func(peer *Peer)
 	OnPeerLost     func(peer *Peer)
 	OnFileOffer    func(from string, fileName string, fileSize int64)
@@ -126,10 +129,115 @@ func NewNode(name string, downloadDir string) *Node {
 		Name:        name,
 		peers:       make(map[string]*Peer),
 		SharedFiles: make([]string, 0),
+		tempZips:    make([]string, 0),
 		stopChan:    make(chan struct{}),
 		downloadDir: downloadDir,
 		tlsConfig:   tlsConfig,
 	}
+}
+
+// zipFolder creates a zip archive of the folder and returns the path to the zip file
+func zipFolder(folderPath string) (string, error) {
+	folderName := filepath.Base(folderPath)
+	zipPath := filepath.Join(os.TempDir(), folderName+".zip")
+
+	zipFile, err := os.Create(zipPath)
+	if err != nil {
+		return "", err
+	}
+	defer zipFile.Close()
+
+	zipWriter := zip.NewWriter(zipFile)
+	defer zipWriter.Close()
+
+	err = filepath.Walk(folderPath, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil // skip errors
+		}
+		if info.IsDir() {
+			return nil // skip directories themselves
+		}
+
+		// Get relative path from folder root
+		relPath, err := filepath.Rel(folderPath, path)
+		if err != nil {
+			return nil
+		}
+
+		// Use forward slashes for cross-platform compatibility in zip
+		zipPath := filepath.ToSlash(relPath)
+
+		file, err := os.Open(path)
+		if err != nil {
+			return nil
+		}
+		defer file.Close()
+
+		writer, err := zipWriter.Create(zipPath)
+		if err != nil {
+			return err
+		}
+
+		_, err = io.Copy(writer, file)
+		return err
+	})
+
+	if err != nil {
+		os.Remove(zipPath)
+		return "", err
+	}
+
+	return zipPath, nil
+}
+
+// UnzipFile extracts a zip archive to the destination directory
+func UnzipFile(zipPath, destDir string) error {
+	reader, err := zip.OpenReader(zipPath)
+	if err != nil {
+		return err
+	}
+	defer reader.Close()
+
+	for _, file := range reader.File {
+		// Convert zip path (forward slashes) to OS-native path
+		filePath := filepath.Join(destDir, filepath.FromSlash(file.Name))
+
+		// Security check: ensure path is within destDir
+		if !strings.HasPrefix(filepath.Clean(filePath), filepath.Clean(destDir)+string(os.PathSeparator)) {
+			continue // skip files that would escape destDir
+		}
+
+		if file.FileInfo().IsDir() {
+			os.MkdirAll(filePath, 0755)
+			continue
+		}
+
+		// Create parent directories
+		if err := os.MkdirAll(filepath.Dir(filePath), 0755); err != nil {
+			return err
+		}
+
+		// Create file
+		destFile, err := os.Create(filePath)
+		if err != nil {
+			return err
+		}
+
+		srcFile, err := file.Open()
+		if err != nil {
+			destFile.Close()
+			return err
+		}
+
+		_, err = io.Copy(destFile, srcFile)
+		srcFile.Close()
+		destFile.Close()
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 func (n *Node) Start() error {
@@ -146,6 +254,16 @@ func (n *Node) Start() error {
 func (n *Node) Stop() {
 	n.running = false
 	close(n.stopChan)
+	n.Cleanup()
+}
+
+func (n *Node) Cleanup() {
+	n.sharedMu.Lock()
+	defer n.sharedMu.Unlock()
+	for _, zipPath := range n.tempZips {
+		os.Remove(zipPath)
+	}
+	n.tempZips = nil
 }
 
 func (n *Node) GetPeers() []*Peer {
@@ -169,16 +287,14 @@ func (n *Node) ShareFile(filePath string) error {
 	defer n.sharedMu.Unlock()
 
 	if stat.IsDir() {
-		// Share all files in directory recursively
-		return filepath.Walk(filePath, func(path string, info os.FileInfo, err error) error {
-			if err != nil {
-				return nil // skip errors
-			}
-			if !info.IsDir() {
-				n.SharedFiles = append(n.SharedFiles, path)
-			}
-			return nil
-		})
+		// Zip the folder and share the zip file
+		zipPath, err := zipFolder(filePath)
+		if err != nil {
+			return err
+		}
+		n.SharedFiles = append(n.SharedFiles, zipPath)
+		n.tempZips = append(n.tempZips, zipPath)
+		return nil
 	}
 
 	n.SharedFiles = append(n.SharedFiles, filePath)

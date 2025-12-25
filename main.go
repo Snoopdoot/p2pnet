@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -214,12 +215,21 @@ func (p *P2PApp) setupUI() {
 				return
 			}
 			folderPath := uri.Path()
-			if err := p.node.ShareFile(folderPath); err != nil {
-				dialog.ShowError(err, p.window)
-				return
-			}
-			p.sharedList.Refresh()
-			p.statusLabel.SetText(fmt.Sprintf("Now sharing folder: %s (%d files)", filepath.Base(folderPath), len(p.node.SharedFiles)))
+			folderName := filepath.Base(folderPath)
+			p.statusLabel.SetText(fmt.Sprintf("Zipping folder: %s...", folderName))
+
+			go func() {
+				err := p.node.ShareFile(folderPath)
+				fyne.Do(func() {
+					if err != nil {
+						p.statusLabel.SetText(fmt.Sprintf("Error: %v", err))
+						dialog.ShowError(err, p.window)
+						return
+					}
+					p.sharedList.Refresh()
+					p.statusLabel.SetText(fmt.Sprintf("Now sharing: %s.zip", folderName))
+				})
+			}()
 		}, p.window)
 	})
 
@@ -383,8 +393,42 @@ func (p *P2PApp) setupCallbacks() {
 
 	p.node.OnFileReceived = func(filePath string) {
 		fyne.Do(func() {
-			p.statusLabel.SetText(fmt.Sprintf("Downloaded: %s", filepath.Base(filePath)))
-			dialog.ShowInformation("Download Complete", fmt.Sprintf("File saved to:\n%s", filePath), p.window)
+			fileName := filepath.Base(filePath)
+			p.statusLabel.SetText(fmt.Sprintf("Downloaded: %s", fileName))
+
+			// Check if it's a zip file and offer to extract
+			if strings.HasSuffix(strings.ToLower(fileName), ".zip") {
+				folderName := strings.TrimSuffix(fileName, filepath.Ext(fileName))
+				extractDir := filepath.Join(filepath.Dir(filePath), folderName)
+
+				dialog.ShowConfirm("Extract Archive",
+					fmt.Sprintf("Extract '%s' to folder '%s'?", fileName, folderName),
+					func(extract bool) {
+						if extract {
+							go func() {
+								err := peer.UnzipFile(filePath, extractDir)
+								fyne.Do(func() {
+									if err != nil {
+										p.statusLabel.SetText(fmt.Sprintf("Extract error: %v", err))
+										dialog.ShowError(err, p.window)
+									} else {
+										p.statusLabel.SetText(fmt.Sprintf("Extracted to: %s", folderName))
+										dialog.ShowInformation("Extraction Complete",
+											fmt.Sprintf("Files extracted to:\n%s", extractDir), p.window)
+									}
+								})
+							}()
+						} else {
+							dialog.ShowInformation("Download Complete",
+								fmt.Sprintf("File saved to:\n%s", filePath), p.window)
+						}
+					},
+					p.window,
+				)
+			} else {
+				dialog.ShowInformation("Download Complete",
+					fmt.Sprintf("File saved to:\n%s", filePath), p.window)
+			}
 		})
 	}
 }
