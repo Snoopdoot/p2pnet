@@ -86,11 +86,17 @@ func generateTLSConfig() (*tls.Config, error) {
 		NotBefore:             time.Now(),
 		NotAfter:              time.Now().Add(365 * 24 * time.Hour),
 		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
 		BasicConstraintsValid: true,
+		IPAddresses:           []net.IP{net.ParseIP("127.0.0.1")},
 	}
 
 	certDER, err := x509.CreateCertificate(rand.Reader, &template, &template, &privateKey.PublicKey, privateKey)
+	if err != nil {
+		return nil, err
+	}
+
+	leaf, err := x509.ParseCertificate(certDER)
 	if err != nil {
 		return nil, err
 	}
@@ -99,7 +105,9 @@ func generateTLSConfig() (*tls.Config, error) {
 		Certificates: []tls.Certificate{{
 			Certificate: [][]byte{certDER},
 			PrivateKey:  privateKey,
+			Leaf:        leaf,
 		}},
+		MinVersion: tls.VersionTLS12,
 	}, nil
 }
 
