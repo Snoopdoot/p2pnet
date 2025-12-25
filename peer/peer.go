@@ -440,13 +440,6 @@ func (n *Node) listenTransfer() {
 			continue
 		}
 
-		// Set TCP options for better performance
-		if tcpConn, ok := conn.(*net.TCPConn); ok {
-			tcpConn.SetNoDelay(true)
-			tcpConn.SetReadBuffer(BufferSize)
-			tcpConn.SetWriteBuffer(BufferSize)
-		}
-
 		go n.handleTransfer(conn)
 	}
 }
@@ -492,8 +485,9 @@ func (n *Node) handleTransfer(conn net.Conn) {
 		encoder := json.NewEncoder(conn)
 		encoder.Encode(response)
 
-		// Direct copy - no buffering
-		io.Copy(conn, file)
+		// Use sendfile-style copy with large buffer
+		buf := make([]byte, 1024*1024) // 1MB buffer
+		io.CopyBuffer(conn, file, buf)
 
 	case "offer":
 		if n.OnFileOffer != nil {
@@ -527,13 +521,6 @@ func (n *Node) RequestFile(ctx context.Context, peerAddr string, fileName string
 		return err
 	}
 	defer conn.Close()
-
-	// Set TCP options for better performance
-	if tcpConn, ok := conn.(*net.TCPConn); ok {
-		tcpConn.SetNoDelay(true)
-		tcpConn.SetReadBuffer(BufferSize)
-		tcpConn.SetWriteBuffer(BufferSize)
-	}
 
 	msg := Message{
 		Type:     "request",
@@ -582,8 +569,10 @@ func (n *Node) RequestFile(ctx context.Context, peerAddr string, fileName string
 	// Simple approach: use io.CopyN for the remaining bytes
 	remaining := response.FileSize - received
 
-	// Copy in chunks to allow progress updates
-	chunkSize := int64(256 * 1024) // 256KB chunks for frequent updates
+	// Copy with progress tracking
+	buf := make([]byte, 1024*1024) // 1MB buffer
+	lastUpdate := time.Now()
+
 	for remaining > 0 {
 		select {
 		case <-ctx.Done():
@@ -593,27 +582,34 @@ func (n *Node) RequestFile(ctx context.Context, peerAddr string, fileName string
 		default:
 		}
 
-		toRead := chunkSize
-		if remaining < toRead {
-			toRead = remaining
-		}
-
-		copied, err := io.CopyN(file, conn, toRead)
-		received += copied
-		remaining -= copied
-
-		// Update progress
-		transfer.BytesReceived = received
-		transfer.Progress = float64(received) / float64(response.FileSize)
-		elapsed := time.Since(startTime).Seconds()
-		if elapsed > 0 {
-			transfer.BytesPerSecond = float64(received) / elapsed
-			if transfer.BytesPerSecond > 0 {
-				transfer.ETA = time.Duration(float64(remaining)/transfer.BytesPerSecond) * time.Second
+		nr, err := conn.Read(buf)
+		if nr > 0 {
+			nw, werr := file.Write(buf[:nr])
+			if werr != nil {
+				return werr
 			}
-		}
-		if n.OnTransfer != nil {
-			n.OnTransfer(transfer)
+			if nw != nr {
+				return fmt.Errorf("short write")
+			}
+			received += int64(nr)
+			remaining -= int64(nr)
+
+			// Update progress every 200ms
+			if time.Since(lastUpdate) >= 200*time.Millisecond {
+				transfer.BytesReceived = received
+				transfer.Progress = float64(received) / float64(response.FileSize)
+				elapsed := time.Since(startTime).Seconds()
+				if elapsed > 0 {
+					transfer.BytesPerSecond = float64(received) / elapsed
+					if transfer.BytesPerSecond > 0 {
+						transfer.ETA = time.Duration(float64(remaining)/transfer.BytesPerSecond) * time.Second
+					}
+				}
+				if n.OnTransfer != nil {
+					n.OnTransfer(transfer)
+				}
+				lastUpdate = time.Now()
+			}
 		}
 
 		if err != nil {
