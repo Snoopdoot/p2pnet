@@ -430,8 +430,12 @@ func getLocalIP() string {
 
 	for _, addr := range addrs {
 		if ipnet, ok := addr.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
-			if ipnet.IP.To4() != nil {
-				return ipnet.IP.String()
+			if ip4 := ipnet.IP.To4(); ip4 != nil {
+				// Skip link-local addresses (169.254.x.x on Windows APIPA)
+				if ipnet.IP.IsLinkLocalUnicast() {
+					continue
+				}
+				return ip4.String()
 			}
 		}
 	}
