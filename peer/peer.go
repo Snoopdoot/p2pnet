@@ -336,11 +336,17 @@ func (n *Node) RequestFile(peerAddr string, fileName string) error {
 		From:     peerAddr,
 	}
 
+	// Use MultiReader to first drain any bytes buffered by the JSON decoder,
+	// then continue reading from the connection. This fixes cross-platform
+	// issues where TCP packetization differences cause the decoder to buffer
+	// part of the file data.
+	reader := io.MultiReader(decoder.Buffered(), conn)
+
 	buf := make([]byte, BufferSize)
 	var received int64 = 0
 
 	for received < response.FileSize {
-		nr, err := conn.Read(buf)
+		nr, err := reader.Read(buf)
 		if err != nil {
 			if err == io.EOF {
 				break
