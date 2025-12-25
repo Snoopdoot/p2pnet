@@ -2,7 +2,6 @@ package peer
 
 import (
 	"archive/zip"
-	"bufio"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -490,16 +489,11 @@ func (n *Node) handleTransfer(conn net.Conn) {
 			FileSize: stat.Size(),
 		}
 
-		// Use buffered writer to reduce TLS record overhead
-		bufWriter := bufio.NewWriterSize(conn, BufferSize)
-		encoder := json.NewEncoder(bufWriter)
+		encoder := json.NewEncoder(conn)
 		encoder.Encode(response)
-		bufWriter.Flush()
 
-		// Stream file with large buffer
-		buf := make([]byte, BufferSize)
-		io.CopyBuffer(bufWriter, file, buf)
-		bufWriter.Flush()
+		// Direct copy - no buffering
+		io.Copy(conn, file)
 
 	case "offer":
 		if n.OnFileOffer != nil {
@@ -568,10 +562,6 @@ func (n *Node) RequestFile(ctx context.Context, peerAddr string, fileName string
 	}
 	defer file.Close()
 
-	// Use buffered writer for efficient disk I/O
-	bufWriter := bufio.NewWriterSize(file, BufferSize)
-	defer bufWriter.Flush()
-
 	startTime := time.Now()
 	transfer := &FileTransfer{
 		FileName:  response.FileName,
@@ -584,55 +574,48 @@ func (n *Node) RequestFile(ctx context.Context, peerAddr string, fileName string
 	// Drain any bytes buffered by the JSON decoder first
 	buffered := decoder.Buffered()
 	bufferedBytes, _ := io.ReadAll(buffered)
-	if len(bufferedBytes) > 0 {
-		bufWriter.Write(bufferedBytes)
-	}
 	received := int64(len(bufferedBytes))
+	if len(bufferedBytes) > 0 {
+		file.Write(bufferedBytes)
+	}
 
-	// Simple copy loop with progress tracking
-	buf := make([]byte, BufferSize)
-	lastUpdate := time.Now()
+	// Simple approach: use io.CopyN for the remaining bytes
+	remaining := response.FileSize - received
 
-	for received < response.FileSize {
-		// Check cancellation periodically
+	// Copy in chunks to allow progress updates
+	chunkSize := int64(10 * 1024 * 1024) // 10MB chunks
+	for remaining > 0 {
 		select {
 		case <-ctx.Done():
-			bufWriter.Flush()
 			file.Close()
 			os.Remove(destPath)
 			return ctx.Err()
 		default:
 		}
 
-		nr, err := conn.Read(buf)
-		if nr > 0 {
-			nw, werr := bufWriter.Write(buf[:nr])
-			if werr != nil {
-				return werr
-			}
-			if nw != nr {
-				return fmt.Errorf("short write")
-			}
-			received += int64(nr)
+		toRead := chunkSize
+		if remaining < toRead {
+			toRead = remaining
+		}
 
-			// Update progress every 100ms
-			if time.Since(lastUpdate) >= 100*time.Millisecond {
-				transfer.BytesReceived = received
-				transfer.Progress = float64(received) / float64(response.FileSize)
-				elapsed := time.Since(startTime).Seconds()
-				if elapsed > 0 {
-					transfer.BytesPerSecond = float64(received) / elapsed
-					remaining := response.FileSize - received
-					if transfer.BytesPerSecond > 0 {
-						transfer.ETA = time.Duration(float64(remaining)/transfer.BytesPerSecond) * time.Second
-					}
-				}
-				if n.OnTransfer != nil {
-					n.OnTransfer(transfer)
-				}
-				lastUpdate = time.Now()
+		copied, err := io.CopyN(file, conn, toRead)
+		received += copied
+		remaining -= copied
+
+		// Update progress
+		transfer.BytesReceived = received
+		transfer.Progress = float64(received) / float64(response.FileSize)
+		elapsed := time.Since(startTime).Seconds()
+		if elapsed > 0 {
+			transfer.BytesPerSecond = float64(received) / elapsed
+			if transfer.BytesPerSecond > 0 {
+				transfer.ETA = time.Duration(float64(remaining)/transfer.BytesPerSecond) * time.Second
 			}
 		}
+		if n.OnTransfer != nil {
+			n.OnTransfer(transfer)
+		}
+
 		if err != nil {
 			if err == io.EOF {
 				break
@@ -640,8 +623,6 @@ func (n *Node) RequestFile(ctx context.Context, peerAddr string, fileName string
 			return err
 		}
 	}
-
-	bufWriter.Flush()
 
 	// Final update
 	transfer.Progress = 1.0
