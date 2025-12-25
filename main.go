@@ -216,11 +216,21 @@ func (p *P2PApp) setupUI() {
 			}
 			folderPath := uri.Path()
 			folderName := filepath.Base(folderPath)
-			p.statusLabel.SetText(fmt.Sprintf("Zipping folder: %s...", folderName))
+
+			fyne.Do(func() {
+				p.progressBar.Show()
+				p.progressBar.SetValue(0)
+				p.statusLabel.SetText(fmt.Sprintf("Zipping folder: %s...", folderName))
+			})
 
 			go func() {
-				err := p.node.ShareFile(folderPath)
+				err := p.node.ShareFileWithProgress(folderPath, func(progress float64) {
+					fyne.Do(func() {
+						p.progressBar.SetValue(progress)
+					})
+				})
 				fyne.Do(func() {
+					p.progressBar.Hide()
 					if err != nil {
 						p.statusLabel.SetText(fmt.Sprintf("Error: %v", err))
 						dialog.ShowError(err, p.window)

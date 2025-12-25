@@ -24,7 +24,7 @@ import (
 const (
 	BroadcastPort = 42069
 	TransferPort  = 42070
-	BufferSize    = 32 * 1024
+	BufferSize    = 256 * 1024 // 256KB for better throughput
 )
 
 type Message struct {
@@ -136,10 +136,22 @@ func NewNode(name string, downloadDir string) *Node {
 	}
 }
 
+// ProgressCallback reports progress as a value between 0.0 and 1.0
+type ProgressCallback func(progress float64)
+
 // zipFolder creates a zip archive of the folder and returns the path to the zip file
-func zipFolder(folderPath string) (string, error) {
+func zipFolder(folderPath string, onProgress ProgressCallback) (string, error) {
 	folderName := filepath.Base(folderPath)
 	zipPath := filepath.Join(os.TempDir(), folderName+".zip")
+
+	// First pass: calculate total size
+	var totalSize int64
+	filepath.Walk(folderPath, func(path string, info os.FileInfo, err error) error {
+		if err == nil && !info.IsDir() {
+			totalSize += info.Size()
+		}
+		return nil
+	})
 
 	zipFile, err := os.Create(zipPath)
 	if err != nil {
@@ -149,6 +161,9 @@ func zipFolder(folderPath string) (string, error) {
 
 	zipWriter := zip.NewWriter(zipFile)
 	defer zipWriter.Close()
+
+	var processed int64
+	lastUpdate := time.Now()
 
 	err = filepath.Walk(folderPath, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
@@ -165,7 +180,7 @@ func zipFolder(folderPath string) (string, error) {
 		}
 
 		// Use forward slashes for cross-platform compatibility in zip
-		zipPath := filepath.ToSlash(relPath)
+		entryPath := filepath.ToSlash(relPath)
 
 		file, err := os.Open(path)
 		if err != nil {
@@ -173,18 +188,35 @@ func zipFolder(folderPath string) (string, error) {
 		}
 		defer file.Close()
 
-		writer, err := zipWriter.Create(zipPath)
+		writer, err := zipWriter.Create(entryPath)
 		if err != nil {
 			return err
 		}
 
-		_, err = io.Copy(writer, file)
-		return err
+		written, err := io.Copy(writer, file)
+		if err != nil {
+			return err
+		}
+
+		processed += written
+
+		// Report progress every 100ms
+		if onProgress != nil && totalSize > 0 && time.Since(lastUpdate) >= 100*time.Millisecond {
+			onProgress(float64(processed) / float64(totalSize))
+			lastUpdate = time.Now()
+		}
+
+		return nil
 	})
 
 	if err != nil {
 		os.Remove(zipPath)
 		return "", err
+	}
+
+	// Final progress update
+	if onProgress != nil {
+		onProgress(1.0)
 	}
 
 	return zipPath, nil
@@ -278,26 +310,31 @@ func (n *Node) GetPeers() []*Peer {
 }
 
 func (n *Node) ShareFile(filePath string) error {
+	return n.ShareFileWithProgress(filePath, nil)
+}
+
+func (n *Node) ShareFileWithProgress(filePath string, onProgress ProgressCallback) error {
 	stat, err := os.Stat(filePath)
 	if err != nil {
 		return err
 	}
 
-	n.sharedMu.Lock()
-	defer n.sharedMu.Unlock()
-
 	if stat.IsDir() {
 		// Zip the folder and share the zip file
-		zipPath, err := zipFolder(filePath)
+		zipPath, err := zipFolder(filePath, onProgress)
 		if err != nil {
 			return err
 		}
+		n.sharedMu.Lock()
 		n.SharedFiles = append(n.SharedFiles, zipPath)
 		n.tempZips = append(n.tempZips, zipPath)
+		n.sharedMu.Unlock()
 		return nil
 	}
 
+	n.sharedMu.Lock()
 	n.SharedFiles = append(n.SharedFiles, filePath)
+	n.sharedMu.Unlock()
 	return nil
 }
 
@@ -531,27 +568,38 @@ func (n *Node) RequestFile(ctx context.Context, peerAddr string, fileName string
 	buf := make([]byte, BufferSize)
 	var received int64 = 0
 	lastUpdate := time.Now()
+	lastCancelCheck := time.Now()
 
 	for received < response.FileSize {
-		// Check for cancellation
-		select {
-		case <-ctx.Done():
-			file.Close()
-			os.Remove(destPath) // Clean up partial file
-			return ctx.Err()
-		default:
+		// Check for cancellation every 500ms (not every read)
+		if time.Since(lastCancelCheck) >= 500*time.Millisecond {
+			select {
+			case <-ctx.Done():
+				file.Close()
+				os.Remove(destPath) // Clean up partial file
+				return ctx.Err()
+			default:
+			}
+			lastCancelCheck = time.Now()
+			// Set a generous deadline for the next batch of reads
+			conn.SetReadDeadline(time.Now().Add(30 * time.Second))
 		}
-
-		// Set read deadline to allow cancellation checks
-		conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
 
 		nr, err := reader.Read(buf)
 		if err != nil {
-			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				continue // Timeout - check cancellation and retry
-			}
 			if err == io.EOF {
 				break
+			}
+			// On timeout, check cancellation
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				select {
+				case <-ctx.Done():
+					file.Close()
+					os.Remove(destPath)
+					return ctx.Err()
+				default:
+					continue
+				}
 			}
 			return err
 		}
