@@ -243,18 +243,17 @@ func (p *P2PApp) setupUI() {
 		}, p.window)
 	})
 
-	refreshBtn := widget.NewButton("Refresh", func() {
-		go p.refreshAllPeerFiles()
-	})
-
 	// Layout - 3 columns
 	peersCard := widget.NewCard("Peers", "On your network", p.peerList)
 	peerFilesCard := widget.NewCard("All Available Files", "Click to download (auto-refreshes)", p.peerFilesList)
 	sharedCard := widget.NewCard("Your Shared Files", "Visible to peers", p.sharedList)
 
+	// Create consistent panel structure
 	leftPanel := container.NewBorder(nil, nil, nil, nil, peersCard)
-	middlePanel := container.NewBorder(nil, refreshBtn, nil, nil, peerFilesCard)
-	shareButtons := container.NewVBox(addFileBtn, addFolderBtn)
+	middlePanel := container.NewBorder(nil, nil, nil, nil, peerFilesCard)
+
+	// Integrate share buttons into the right panel
+	shareButtons := container.NewHBox(addFileBtn, addFolderBtn)
 	rightPanel := container.NewBorder(nil, shareButtons, nil, nil, sharedCard)
 
 	split1 := container.NewHSplit(leftPanel, middlePanel)
