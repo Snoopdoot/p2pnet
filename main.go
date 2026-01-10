@@ -243,18 +243,38 @@ func (p *P2PApp) setupUI() {
 		}, p.window)
 	})
 
-	// Layout - 3 columns
-	peersCard := widget.NewCard("Peers", "On your network", p.peerList)
-	peerFilesCard := widget.NewCard("All Available Files", "Click to download (auto-refreshes)", p.peerFilesList)
-	sharedCard := widget.NewCard("Your Shared Files", "Visible to peers", p.sharedList)
+	// Layout - 3 columns with centered headers
+	peersHeader := widget.NewLabelWithStyle("Peers", fyne.TextAlignCenter, fyne.TextStyle{Bold: true})
+	peersSubHeader := widget.NewLabelWithStyle("On your network", fyne.TextAlignCenter, fyne.TextStyle{})
+	peersCard := container.NewBorder(
+		container.NewVBox(peersHeader, peersSubHeader),
+		nil, nil, nil,
+		p.peerList,
+	)
+
+	filesHeader := widget.NewLabelWithStyle("All Available Files", fyne.TextAlignCenter, fyne.TextStyle{Bold: true})
+	filesSubHeader := widget.NewLabelWithStyle("Click to download (auto-refreshes)", fyne.TextAlignCenter, fyne.TextStyle{})
+	peerFilesCard := container.NewBorder(
+		container.NewVBox(filesHeader, filesSubHeader),
+		nil, nil, nil,
+		p.peerFilesList,
+	)
+
+	sharedHeader := widget.NewLabelWithStyle("Your Shared Files", fyne.TextAlignCenter, fyne.TextStyle{Bold: true})
+	sharedSubHeader := widget.NewLabelWithStyle("Visible to peers", fyne.TextAlignCenter, fyne.TextStyle{})
+	sharedContent := container.NewBorder(
+		container.NewVBox(sharedHeader, sharedSubHeader),
+		nil, nil, nil,
+		p.sharedList,
+	)
 
 	// Create consistent panel structure
 	leftPanel := container.NewBorder(nil, nil, nil, nil, peersCard)
 	middlePanel := container.NewBorder(nil, nil, nil, nil, peerFilesCard)
 
-	// Integrate share buttons into the right panel
-	shareButtons := container.NewHBox(addFileBtn, addFolderBtn)
-	rightPanel := container.NewBorder(nil, shareButtons, nil, nil, sharedCard)
+	// Integrate share buttons into the right panel with centered buttons
+	shareButtons := container.NewCenter(container.NewHBox(addFileBtn, addFolderBtn))
+	rightPanel := container.NewBorder(nil, shareButtons, nil, nil, sharedContent)
 
 	split1 := container.NewHSplit(leftPanel, middlePanel)
 	split1.SetOffset(0.33)
