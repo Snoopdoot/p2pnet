@@ -249,7 +249,7 @@ func (p *P2PApp) setupUI() {
 	peersCard := container.NewBorder(
 		container.NewVBox(peersHeader, peersSubHeader),
 		nil, nil, nil,
-		p.peerList,
+		container.NewPadded(p.peerList),
 	)
 
 	filesHeader := widget.NewLabelWithStyle("All Available Files", fyne.TextAlignCenter, fyne.TextStyle{Bold: true})
@@ -257,7 +257,7 @@ func (p *P2PApp) setupUI() {
 	peerFilesCard := container.NewBorder(
 		container.NewVBox(filesHeader, filesSubHeader),
 		nil, nil, nil,
-		p.peerFilesList,
+		container.NewPadded(p.peerFilesList),
 	)
 
 	sharedHeader := widget.NewLabelWithStyle("Your Shared Files", fyne.TextAlignCenter, fyne.TextStyle{Bold: true})
@@ -265,7 +265,7 @@ func (p *P2PApp) setupUI() {
 	sharedContent := container.NewBorder(
 		container.NewVBox(sharedHeader, sharedSubHeader),
 		nil, nil, nil,
-		p.sharedList,
+		container.NewPadded(p.sharedList),
 	)
 
 	// Create consistent panel structure
